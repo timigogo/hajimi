@@ -465,8 +465,6 @@ async def execute_claude_call(
         print(f"Claude API call to: {endpoint}")
         print(f"Request payload keys: {list(request_payload.keys())}")
         
-        
-        
         async with aiohttp.ClientSession() as session:
             async with session.post(endpoint, json=request_payload, headers=headers) as response:
                 if response.status != 200:
