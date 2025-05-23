@@ -28,6 +28,6 @@ FAKE_STREAMING_ENABLED = os.environ.get("FAKE_STREAMING", "false").lower() == "t
 FAKE_STREAMING_INTERVAL_SECONDS = float(os.environ.get("FAKE_STREAMING_INTERVAL", "1.0"))
 
 # URL for the remote JSON file containing model lists
-MODELS_CONFIG_URL = os.environ.get("MODELS_CONFIG_URL", "https://raw.githubusercontent.com/gzzhongqi/vertex2openai/refs/heads/main/vertexModels.json")
+MODELS_CONFIG_URL = os.environ.get("MODELS_CONFIG_URL", "https://raw.githubusercontent.com/gzzhongqi/vertex2openai/refs/heads/claudetest/vertexModels.json")
 
 # Validation logic moved to app/auth.py
