@@ -23,12 +23,18 @@ from message_processing import (
     create_gemini_prompt,
     create_encrypted_gemini_prompt,
     create_encrypted_full_gemini_prompt,
+    create_claude_prompt,
+    create_encrypted_claude_prompt,
     split_text_by_completion_tokens # Added
 )
 from api_helpers import (
     create_generation_config,
+    create_claude_generation_config,
     create_openai_error_response,
     execute_gemini_call,
+    execute_claude_call,
+    claude_fake_stream_generator,
+    convert_claude_response_to_openai,
     openai_fake_stream_generator # Added
 )
 
@@ -98,6 +104,63 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
             return JSONResponse(status_code=400, content=create_openai_error_response(400, f"Model '{request.model}' (-nothinking) is only supported for 'gemini-2.5-flash-preview-04-17'.", "invalid_request_error"))
         if is_max_thinking_model and base_model_name != "gemini-2.5-flash-preview-04-17":
             return JSONResponse(status_code=400, content=create_openai_error_response(400, f"Model '{request.model}' (-max) is only supported for 'gemini-2.5-flash-preview-04-17'.", "invalid_request_error"))
+
+        # Check if this is a Claude model
+        is_claude_model = "claude" in base_model_name.lower()
+        
+        if is_claude_model:
+            # Claude models only work with SA credentials (as specified)
+            print(f"INFO: Detected Claude model '{request.model}' (base: {base_model_name}). Using SA credentials.")
+            rotated_credentials, rotated_project_id = credential_manager_instance.get_random_credentials()
+            
+            if not rotated_credentials or not rotated_project_id:
+                error_msg = "Claude models require SA credentials, but none were available or loaded successfully."
+                print(f"ERROR: {error_msg}")
+                return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
+            
+            # Create Claude generation config
+            claude_generation_config = create_claude_generation_config(request)
+            
+            # Convert messages to Claude format
+            if is_encrypted_full_model:
+                # Use encrypted full prompt (not implemented for Claude yet, fallback to encrypted)
+                claude_messages = create_encrypted_claude_prompt(request.messages)
+            elif is_encrypted_model:
+                claude_messages = create_encrypted_claude_prompt(request.messages)
+            else:
+                claude_messages = create_claude_prompt(request.messages)
+            
+            # Handle streaming vs non-streaming
+            if request.stream:
+                print(f"INFO: Claude streaming enabled for model '{request.model}'")
+                return StreamingResponse(
+                    claude_fake_stream_generator(
+                        gcp_credentials=rotated_credentials,
+                        gcp_project_id=rotated_project_id,
+                        model_name=base_model_name,
+                        claude_messages=claude_messages,
+                        generation_config=claude_generation_config,
+                        request_obj=request,
+                        is_auto_attempt=False
+                    ),
+                    media_type="text/event-stream"
+                )
+            else:
+                print(f"INFO: Claude non-streaming request for model '{request.model}'")
+                try:
+                    claude_response = await execute_claude_call(
+                        gcp_credentials=rotated_credentials,
+                        gcp_project_id=rotated_project_id,
+                        model_name=base_model_name,
+                        claude_messages=claude_messages,
+                        generation_config=claude_generation_config,
+                        request_obj=request,
+                        is_auto_attempt=False
+                    )
+                    return JSONResponse(content=convert_claude_response_to_openai(claude_response, request.model))
+                except Exception as e:
+                    print(f"ERROR: Claude API call failed: {e}")
+                    return JSONResponse(status_code=500, content=create_openai_error_response(500, str(e), "server_error"))
 
         generation_config = create_generation_config(request)
 

@@ -22,6 +22,7 @@ from message_processing import (
     parse_gemini_response_for_reasoning_and_content # Added import
 )
 import config as app_config
+import aiohttp
 
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
     return {
@@ -384,3 +385,223 @@ async def execute_gemini_call(
         if not is_gemini_response_valid(response_obj_call): 
             raise ValueError(f"Invalid non-streaming Gemini response for model string '{model_to_call}'. Resp: {str(response_obj_call)[:200]}")
         return JSONResponse(content=convert_to_openai_format(response_obj_call, request_obj.model))
+
+def create_claude_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
+    """Create generation config for Claude API"""
+    config = {
+        "anthropic_version": "vertex-2023-10-16"
+    }
+    
+    if request.max_tokens is not None: 
+        config["max_tokens"] = request.max_tokens
+    else:
+        config["max_tokens"] = 4096  # Default for Claude
+        
+    if request.temperature is not None: 
+        config["temperature"] = request.temperature
+    if request.top_p is not None: 
+        config["top_p"] = request.top_p
+    if request.top_k is not None: 
+        config["top_k"] = request.top_k
+    if request.stop is not None: 
+        config["stop_sequences"] = request.stop
+        
+    # Claude specific streaming setting
+    if request.stream:
+        config["stream"] = True
+        
+    return config
+
+async def execute_claude_call(
+    gcp_credentials: Any,
+    gcp_project_id: str, 
+    model_name: str,
+    claude_messages: List[Dict[str, Any]],
+    generation_config: Dict[str, Any],
+    request_obj: OpenAIRequest,
+    is_auto_attempt: bool = False
+):
+    """Execute Claude API call through Vertex AI"""
+    print(f"Executing Claude API call for model: {model_name}")
+    
+    try:
+        # Refresh token
+        from credentials_manager import _refresh_auth
+        gcp_token = _refresh_auth(gcp_credentials)
+        
+        if not gcp_token:
+            raise Exception("Failed to obtain valid GCP token for Claude API call")
+            
+        # Build the request payload
+        request_payload = {
+            "anthropic_version": generation_config.get("anthropic_version", "vertex-2023-10-16"),
+            "messages": claude_messages
+        }
+        
+        # Add generation config parameters
+        if "max_tokens" in generation_config:
+            request_payload["max_tokens"] = generation_config["max_tokens"]
+        if "temperature" in generation_config:
+            request_payload["temperature"] = generation_config["temperature"]
+        if "top_p" in generation_config:
+            request_payload["top_p"] = generation_config["top_p"]
+        if "top_k" in generation_config:
+            request_payload["top_k"] = generation_config["top_k"]
+        if "stop_sequences" in generation_config:
+            request_payload["stop_sequences"] = generation_config["stop_sequences"]
+        if "stream" in generation_config:
+            request_payload["stream"] = generation_config["stream"]
+            
+        # Build the API endpoint
+        LOCATION = "global"  # Use global region as specified
+        endpoint = f"https://aiplatform.googleapis.com/v1/projects/{gcp_project_id}/locations/{LOCATION}/publishers/anthropic/models/{model_name}:streamRawPredict"
+        
+        # Set up headers
+        headers = {
+            "Authorization": f"Bearer {gcp_token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        
+        print(f"Claude API call to: {endpoint}")
+        print(f"Request payload keys: {list(request_payload.keys())}")
+        
+        
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, json=request_payload, headers=headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"Claude API call failed with status {response.status}: {error_text}")
+                    
+                response_data = await response.json()
+                return response_data
+                
+    except Exception as e:
+        print(f"ERROR in execute_claude_call: {e}")
+        raise
+
+async def claude_fake_stream_generator(
+    gcp_credentials: Any,
+    gcp_project_id: str,
+    model_name: str, 
+    claude_messages: List[Dict[str, Any]],
+    generation_config: Dict[str, Any],
+    request_obj: OpenAIRequest,
+    is_auto_attempt: bool = False
+):
+    """Generate fake streaming response for Claude models"""
+    print(f"FAKE STREAMING (Claude): Starting for model '{request_obj.model}' (API model: '{model_name}')")
+    response_id = f"chatcmpl-{int(time.time())}"
+    
+    # Create the API call task
+    api_call_task = asyncio.create_task(
+        execute_claude_call(
+            gcp_credentials, gcp_project_id, model_name, 
+            claude_messages, generation_config, request_obj, is_auto_attempt
+        )
+    )
+    
+    # Keep-alive loop while the main API call is in progress
+    outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
+    if outer_keep_alive_interval > 0:
+        while not api_call_task.done():
+            keep_alive_data = {
+                "id": "chatcmpl-keepalive", 
+                "object": "chat.completion.chunk", 
+                "created": int(time.time()), 
+                "model": request_obj.model, 
+                "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+            await asyncio.sleep(outer_keep_alive_interval)
+    
+    try:
+        claude_response = await api_call_task
+        
+        # Extract text from Claude response
+        response_text = ""
+        if claude_response and "content" in claude_response:
+            for content_item in claude_response["content"]:
+                if content_item.get("type") == "text":
+                    response_text += content_item.get("text", "")
+        
+        # Process text for encryption if needed
+        if request_obj.model.endswith("-encrypt") or request_obj.model.endswith("-encrypt-full"):
+            response_text = deobfuscate_text(response_text)
+        
+        # Chunk the response for streaming
+        content_to_chunk = response_text
+        chunk_size = max(20, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 0
+        
+        if not content_to_chunk:
+            empty_delta_data = {
+                "id": response_id, 
+                "object": "chat.completion.chunk", 
+                "created": int(time.time()), 
+                "model": request_obj.model, 
+                "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(empty_delta_data)}\n\n"
+        else:
+            for i in range(0, len(content_to_chunk), chunk_size):
+                chunk_text = content_to_chunk[i:i+chunk_size]
+                content_delta_data = {
+                    "id": response_id, 
+                    "object": "chat.completion.chunk", 
+                    "created": int(time.time()), 
+                    "model": request_obj.model, 
+                    "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(content_delta_data)}\n\n"
+                if len(content_to_chunk) > chunk_size: 
+                    await asyncio.sleep(0.05)
+        
+        # Send final chunk
+        yield create_final_chunk(request_obj.model, response_id)
+        yield "data: [DONE]\n\n"
+        
+    except Exception as e:
+        err_msg_detail = f"Error in claude_fake_stream_generator (model: '{request_obj.model}'): {type(e).__name__} - {str(e)}"
+        print(f"ERROR: {err_msg_detail}")
+        sse_err_msg_display = str(e)
+        if len(sse_err_msg_display) > 512: 
+            sse_err_msg_display = sse_err_msg_display[:512] + "..."
+        err_resp_for_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
+        json_payload_for_fake_stream_error = json.dumps(err_resp_for_sse)
+        if not is_auto_attempt:
+            yield f"data: {json_payload_for_fake_stream_error}\n\n"
+            yield "data: [DONE]\n\n"
+        raise
+
+def convert_claude_response_to_openai(claude_response: Any, model: str) -> Dict[str, Any]:
+    """Convert Claude response to OpenAI format"""
+    response_text = ""
+    if claude_response and "content" in claude_response:
+        for content_item in claude_response["content"]:
+            if content_item.get("type") == "text":
+                response_text += content_item.get("text", "")
+    
+    # Calculate token usage (approximate)
+    prompt_tokens = 0  # Could estimate based on input
+    completion_tokens = len(response_text.split()) if response_text else 0
+    total_tokens = prompt_tokens + completion_tokens
+    
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": response_text
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    }
